@@ -15,7 +15,7 @@
 using namespace std;
 
 // 全局共享资源
-RingBuffer<struct can_frame> frameQueue(100); 
+RingBuffer<struct can_frame> frameQueue(128); 
 bool isRunning = true; 
 
 // 线程 A：专门负责收报文
