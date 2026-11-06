@@ -5,7 +5,7 @@
 //   receiveThread —— poll + read，push 入队，永不阻塞
 //   processThread —— popBatch 批量取帧，锁外做检测与统计
 // ============================================================================
-
+#include <string>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -106,7 +106,37 @@ void receiveThread(int s) {
         }
     }
 }
-
+// 🟢 复制区：调用本地 Ollama 的 AI 函数
+std::string ask_ai(const std::string& prompt) {
+    // 构造 JSON 请求体
+    std::string json_body = "{\"model\":\"qwen2:0.5b\",\"prompt\":\"" + prompt + "\",\"stream\":false}";
+    
+    // 构造 curl 命令
+    std::string cmd = "curl -s http://localhost:11434/api/generate -d '" + json_body + "'";
+    
+    char buffer[4096];
+    std::string result = "";
+    
+    // 调用外部程序并读取输出
+    FILE* pipe = popen(cmd.c_str(), "r");
+    if (!pipe) return "AI 大脑连接失败...";
+    
+    while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+        result += buffer;
+    }
+    pclose(pipe);
+    
+    // 解析返回的 JSON 字符串，提取 "response" 字段的内容
+    size_t pos = result.find("\"response\":\"");
+    if (pos != std::string::npos) {
+        size_t start = pos + 12;
+        size_t end = result.find("\"", start);
+        if (end != std::string::npos) {
+            return result.substr(start, end - start);
+        }
+    }
+    return "AI 解析失败，返回：" + result;
+}
 // ---------------------------------------------------------------------------
 // 处理线程：批量取帧 → 锁外处理
 //
@@ -175,8 +205,13 @@ void processThread() {
             }
             else if (id == 0x7E0 && dlc >= 2 && frame.data[1] == 0x27) {
                 g_bruteforce.fetch_add(1, std::memory_order_relaxed);
-                if (alertBruteforce.allow())
-                    std::cout << "[ALERT] 捕获到 UDS 27 安全访问爆破尝试！\n";
+
+                if (alertBruteforce.allow()) {
+                    std::string prompt = "你是傲娇的车载二次元助手,请用一句话警告主人:汽车正在遭到黑客的UDS安全爆破攻击。";
+                    std::cout << "[AI思考中...]" << std::endl;
+                    std::string ai_reply = ask_ai(prompt);
+                    std::cout << "[AI警告]" << ai_reply << "\n";
+                }
             }
             else {
                 // 正常帧不逐条打印：一次终端 write 是 10~100 µs 的系统调用，
