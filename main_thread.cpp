@@ -137,6 +137,25 @@ std::string ask_ai(const std::string& prompt) {
     }
     return "AI 解析失败，返回：" + result;
 }
+
+void speak(const std::string& text) {
+    std::cout << "[调试] 准备生成语音..." << std::endl;
+    
+    // 🚨 必须写死绝对路径，因为 sudo 下找不到 ~
+    std::string tts_cmd = "/home/ye/.local/bin/edge-tts --text \"" + text + "\" --voice zh-CN-XiaoyiNeural --write-media /tmp/ai_voice.mp3";
+    
+    int ret = system(tts_cmd.c_str());
+    if (ret != 0) {
+        std::cout << "[调试] TTS 生成失败！错误码: " << ret << std::endl;
+        return;
+    }
+    
+    std::cout << "[调试] 语音生成成功，准备播放..." << std::endl;
+    
+    // 🚨 关键：在 sudo 环境下，强行借用当前桌面用户的音频通道
+    // 假设你的 Ubuntu 用户 ID 是 1000（可以在终端敲 id -u 确认）
+    system("XDG_RUNTIME_DIR=/run/user/1000 mpg123 -q /tmp/ai_voice.mp3 &");
+}
 // ---------------------------------------------------------------------------
 // 处理线程：批量取帧 → 锁外处理
 //
@@ -211,6 +230,9 @@ void processThread() {
                     std::cout << "[AI思考中...]" << std::endl;
                     std::string ai_reply = ask_ai(prompt);
                     std::cout << "[AI警告]" << ai_reply << "\n";
+
+
+                    speak(ai_reply);
                 }
             }
             else {
