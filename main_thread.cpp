@@ -231,6 +231,16 @@ void processThread() {
                     std::string ai_reply = ask_ai(prompt);
                     std::cout << "[AI警告]" << ai_reply << "\n";
 
+                    // 暴力清洗：防止引号破坏 JSON 和 Shell 命令
+                    std::string safe_reply = "";
+                    for (char c : ai_reply) {
+                        if (c != '"' && c != '\'' && c != '\n') safe_reply += c; 
+                    }
+                    std::string log_json = "{\"log\":\"" + safe_reply + "\"}";
+                    
+                    std::string log_cmd = "curl -s -X POST -H \"Content-Type: application/json\" -d '" + log_json + "' http://localhost:5000/api/report > /dev/null";
+                    system(log_cmd.c_str());
+
 
                     speak(ai_reply);
                 }
@@ -254,15 +264,33 @@ void processThread() {
             const std::uint64_t dropped = g_dropped.load(std::memory_order_relaxed);
             const std::uint64_t normal  = g_normal.exchange(0, std::memory_order_relaxed);
 
+            // 👇 把剩下的统计数据也取出来，方便发给网页
+            const std::uint64_t bad = g_bad.exchange(0, std::memory_order_relaxed);
+            const std::uint64_t blacklist = g_blacklisted.exchange(0, std::memory_order_relaxed);
+            const std::uint64_t bruteforce = g_bruteforce.exchange(0, std::memory_order_relaxed);
+
             if (dropped != lastDropped) {
                 std::cout << "[WARN] 队列溢出，累计丢弃 " << dropped << " 帧\n";
                 lastDropped = dropped;
             }
 
+            // 🚀 【核心魔法】拼接 JSON 字符串，并发送给 Python Web 服务器
+            std::string json_payload = "{\"normal\":" + std::to_string(normal) + 
+                                    ",\"bad\":" + std::to_string(bad) + 
+                                    ",\"blacklisted\":" + std::to_string(blacklist) + 
+                                    ",\"bruteforce\":" + std::to_string(bruteforce) + 
+                                    ",\"dropped\":" + std::to_string(dropped) + "}";
+
+            // 用 curl 发送 POST 请求给本地的 Flask 服务器
+            std::string curl_cmd = "curl -s -X POST -H \"Content-Type: application/json\" -d '" + json_payload + "' http://localhost:5000/api/report > /dev/null";
+            system(curl_cmd.c_str());
+
+            // 终端里依然保留原来的打印，让你在终端也能看到
             std::cout << "[STAT] 正常帧 " << normal << " 帧/s"
-                      << " | 畸形 "   << g_bad.exchange(0)
-                      << " | 黑名单 " << g_blacklisted.exchange(0)
-                      << " | 爆破 "   << g_bruteforce.exchange(0) << '\n';
+                    << " | 畸形 " << bad
+                    << " | 黑名单 " << blacklist
+                    << " | 爆破 " << bruteforce << '\n';
+
         }
     }
 }
