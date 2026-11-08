@@ -1,16 +1,31 @@
 cmake_minimum_required(VERSION 3.10)
-project(CanMonitor)
+project(CanSentinel)
 
 # 设置 C++ 标准
-set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# 寻找多线程库 (pthread)
+# 告诉编译器去 include 文件夹里找头文件
+include_directories(include)
+
+# 寻找多线程库
 find_package(Threads REQUIRED)
 
-# 👇 关键！必须先用 add_executable 告诉 CMake 我们要编译生成 CanMonitor 这个程序
-# 注意：这里去掉了 RingBuffer.cpp，因为代码全写在 RingBuffer.h 里了
-add_executable(CanMonitor main_thread.cpp CanFrame.cpp)
+# ==========================================
+# 1. 编译底层网关 (can-gateway)
+# ==========================================
+add_executable(can-gateway 
+    src/can-gateway.cpp 
+    src/CanFrame.cpp
+    # 如果 RingBuffer.cpp 已经删了（代码全在头文件里），就不需要加
+)
+# 链接多线程库
+target_link_libraries(can-gateway Threads::Threads)
 
-# 👇 然后才能给这个程序链接多线程库
-target_link_libraries(CanMonitor Threads::Threads)
+# ==========================================
+# 2. 编译 AI 代理 (alert-agent)
+# ==========================================
+add_executable(alert-agent 
+    src/alert-agent.cpp
+)
+target_link_libraries(alert-agent Threads::Threads)
