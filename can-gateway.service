@@ -1,0 +1,60 @@
+[Unit]
+Description=CAN Security Gateway (receive + detect, no network I/O)
+Documentation=file:///opt/can-sentinel/P1-INSTALL.md
+After=network-pre.target alert-agent.service
+Wants=network-pre.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/opt/can-sentinel/bin/can-gateway
+Restart=always
+RestartSec=2s
+
+# ---------------------------------------------------------------------------
+# 身份：不是 root。只保留打开 CAN raw socket 所需的那一个 capability。
+# 即使进程被完全控制，攻击者拿到的也只是 "能收发 CAN 帧"，不是 "能改系统"。
+# ---------------------------------------------------------------------------
+User=can-gw
+Group=can-gw
+CapabilityBoundingSet=CAP_NET_RAW
+AmbientCapabilities=CAP_NET_RAW
+NoNewPrivileges=yes
+
+# ---------------------------------------------------------------------------
+# 文件系统：只读根 + 私有 /tmp + 私有 /dev。
+# SocketCAN 走 AF_CAN，不需要任何设备节点，PrivateDevices 可以放心开。
+# ---------------------------------------------------------------------------
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=no
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+
+# ---------------------------------------------------------------------------
+# 网络：只能开 AF_UNIX（与 alert-agent 通信）和 AF_CAN（收报文）。
+# 这一行是整套隔离的核心 —— 网关进程在物理上无法发起任何 IP 连接。
+# 若你的 systemd 版本不识别 AF_CAN（会报 "Failed to parse address family"），
+# 删掉这一行即可，其余隔离仍然生效。
+# ---------------------------------------------------------------------------
+RestrictAddressFamilies=AF_UNIX AF_CAN
+
+# ---------------------------------------------------------------------------
+# 其他加固
+# ---------------------------------------------------------------------------
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

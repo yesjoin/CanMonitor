@@ -1,16 +1,17 @@
 #pragma once
 // ============================================================================
-// Ipc.h —— can-gateway 与 alert-agent 之间的私有协议
+// Ipc.h —— can-gateway 与 alert-agent 之间的私有协议（v2）
 //
-// 设计原则：
-//   1. 固定长度 POD 报文，没有 JSON、没有字符串、没有解析器。
-//      网关只能发送"数字"，因此不存在任何注入面（路径、命令、HTML 都不例外）。
-//   2. SOCK_SEQPACKET：保留消息边界，一次 send 对应一次 recv，
-//      不需要自己做粘包/拆包。
-//   3. 发送端 MSG_DONTWAIT：agent 卡住时网关只丢消息，绝不阻塞检测线程。
-//   4. 接收端用 SO_PEERCRED 校验对端 UID，只有网关能连进来。
+// v2 变更（与 v1 不兼容，两端必须同时重编）：
+//   · AlertMsg 增加 count 字段：窗口内命中次数，agent 可直接念出来
+//   · StatsMsg 增加 udsRequests / replay / unlock 三个计数器
+//   · AlertKind 增加 Replay 与 UnauthorizedUnlock
 //
-// 兼容性约束：两端必须用同一份 Ipc.h 编译，报文中带 version 校验。
+// 设计原则不变：
+//   1. 固定长度 POD 报文，没有 JSON、没有字符串、没有解析器；
+//   2. SOCK_SEQPACKET 保留消息边界；
+//   3. 发送端 MSG_DONTWAIT，agent 卡住时只丢消息，绝不阻塞检测线程；
+//   4. 接收端 SO_PEERCRED 校验对端 UID。
 // ============================================================================
 
 #include <cerrno>
@@ -28,17 +29,19 @@
 namespace ipc {
 
 inline constexpr std::uint32_t kMagic   = 0x43414E47u;   // "CANG"
-inline constexpr std::uint32_t kVersion = 1;
+inline constexpr std::uint32_t kVersion = 2;
 
 enum class Type : std::uint32_t {
     Stats = 1,       // 每秒一次聚合统计
-    Alert = 2,       // 检测到攻击
+    Alert = 2,       // 检测到事件
 };
 
 enum class AlertKind : std::uint32_t {
-    Blacklist  = 1,
-    Bruteforce = 2,
-    Malformed  = 3,
+    Blacklist          = 1,   // 命中黑名单 ID（策略性，单帧）
+    Bruteforce         = 2,   // 窗口内 0x27 请求超限（可含 NRC 关联）
+    Malformed          = 3,   // DLC / 结构非法
+    Replay             = 4,   // 短窗口内完全相同的报文重复
+    UnauthorizedUnlock = 5,   // 爆破后出现 0x67 0x27 正响应 —— 最高危
 };
 
 struct Header {
@@ -48,23 +51,25 @@ struct Header {
     std::uint32_t payloadSize;
 };
 
-// 统计：全部是网关侧计数器的快照
 struct StatsMsg {
     std::uint64_t normal;
     std::uint64_t bad;
     std::uint64_t blacklisted;
-    std::uint64_t bruteforce;
+    std::uint64_t bruteforce;    // 本区间内触发的爆破告警次数
     std::uint64_t dropped;       // 用户态队列丢弃（累计）
-    std::uint64_t busError;      // CAN 错误帧
+    std::uint64_t busError;
     std::uint64_t rxOverflow;    // 控制器 RX 溢出（累计）
-    std::uint64_t tsNs;          // 发送时刻（steady_clock，同机可比）
+    std::uint64_t udsRequests;   // 原始 0x27 请求帧数（本区间）
+    std::uint64_t replay;        // 重放告警次数（本区间）
+    std::uint64_t unlock;        // 解锁成功次数（本区间）
+    std::uint64_t tsNs;
 };
 
-// 告警：只有 ID / 类型 / 时间，没有文本。
-// "说什么"是表现层的事，归 agent；"发生了什么"是检测层的事，归网关。
 struct AlertMsg {
     std::uint32_t id;
     std::uint32_t kind;
+    std::uint32_t count;         // 窗口内命中次数，0 表示不适用
+    std::uint32_t reserved;
     std::uint64_t tsNs;
 };
 
@@ -81,12 +86,10 @@ static_assert(kMaxPayload <= 128, "报文过大，检查结构体定义");
 
 enum class SendResult {
     Ok,           // 已完整写入 socket 缓冲区
-    WouldBlock,   // 对端来不及收，本次丢弃即可（EAGAIN）
+    WouldBlock,   // 对端来不及收（EAGAIN），本次丢弃即可
     Broken,       // 对端已关闭或协议错误，需要重连
 };
 
-// ---------------------------------------------------------------------------
-// 连接（客户端：网关）
 // ---------------------------------------------------------------------------
 inline int connectUnix(const std::string& path) {
     if (path.size() >= sizeof(sockaddr_un::sun_path)) return -1;
@@ -105,15 +108,10 @@ inline int connectUnix(const std::string& path) {
     return fd;
 }
 
-// ---------------------------------------------------------------------------
-// 监听（服务端：agent）
-//   mode 默认 0660：owner 是 agent，group 是 can-gw。
-//   目录本身由 systemd 的 RuntimeDirectory 创建（0750，owner ye:can-gw）。
-// ---------------------------------------------------------------------------
 inline int listenUnix(const std::string& path, mode_t mode = 0660) {
     if (path.size() >= sizeof(sockaddr_un::sun_path)) return -1;
 
-    ::unlink(path.c_str());          // 清理上次崩溃留下的陈旧 socket
+    ::unlink(path.c_str());
 
     const int fd = ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
     if (fd < 0) return -1;
@@ -127,9 +125,7 @@ inline int listenUnix(const std::string& path, mode_t mode = 0660) {
         return -1;
     }
 
-    // 必须显式 chmod：systemd 的 UMask 会让 socket 默认是 0600，
-    // 那样网关（另一个 UID，仅靠同组）连不进来。
-    ::chmod(path.c_str(), mode);
+    ::chmod(path.c_str(), mode);      // UMask 会让它变成 0600，必须显式放开组权限
 
     if (::listen(fd, 4) != 0) {
         ::close(fd);
@@ -138,8 +134,6 @@ inline int listenUnix(const std::string& path, mode_t mode = 0660) {
     return fd;
 }
 
-// ---------------------------------------------------------------------------
-// 发送
 // ---------------------------------------------------------------------------
 template <typename T>
 inline SendResult sendPacket(int fd, Type type, const T& body) {
@@ -155,15 +149,11 @@ inline SendResult sendPacket(int fd, Type type, const T& body) {
     const std::size_t total = sizeof(Header) + sizeof(T);
     const ssize_t n = ::send(fd, &p, total, MSG_NOSIGNAL | MSG_DONTWAIT);
 
-    if (n == static_cast<ssize_t>(total))            return SendResult::Ok;
-    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return SendResult::WouldBlock;
+    if (n == static_cast<ssize_t>(total))                     return SendResult::Ok;
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))   return SendResult::WouldBlock;
     return SendResult::Broken;
 }
 
-// ---------------------------------------------------------------------------
-// 接收（带校验）
-//   received：底层 recv 的返回值，用于区分"超时"与"协议错误"
-// ---------------------------------------------------------------------------
 inline bool recvPacket(int fd, Packet& out, ssize_t& received) {
     received = ::recv(fd, &out, sizeof out, 0);
 
@@ -177,9 +167,6 @@ inline bool recvPacket(int fd, Packet& out, ssize_t& received) {
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// 对端身份：Linux 的 SO_PEERCRED
-// ---------------------------------------------------------------------------
 inline bool peerUid(int fd, uid_t& uid) {
     struct ucred cred{};
     socklen_t len = sizeof cred;
@@ -188,9 +175,6 @@ inline bool peerUid(int fd, uid_t& uid) {
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// 工具
-// ---------------------------------------------------------------------------
 inline std::uint64_t nowNs() {
     return static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(

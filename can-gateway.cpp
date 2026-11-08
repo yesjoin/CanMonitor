@@ -1,19 +1,19 @@
 // ============================================================================
-// can-gateway.cpp —— P1：只负责"收 + 判"，不做任何网络 I/O
+// can-gateway.cpp —— P2：有状态检测
 //
-// 进程权限：User=can-gw，CapabilityBoundingSet=CAP_NET_RAW，
-//           RestrictAddressFamilies=AF_UNIX AF_CAN
-//           —— 即使被完全攻陷，也开不出一个 AF_INET socket，无法外联。
+// 相对 P1 的变化：
+//   · 引入 detection::StatefulDetector（滑动窗口 + NRC 关联 + 重放）
+//   · 告警按类型分别限流，Unlock 类优先级最高（1 s），Replay 最低（30 s）
+//   · 统计新增 udsRequests / replay / unlock 三个维度
 //
-// 线程模型：
-//   receiveThread  poll + read              → push g_queue
-//   processThread  popBatch(32) + 规则检测   → 命中 push g_alertQueue (O(1))
-//   ipcThread      每 1 s 发统计，命中即发告警 → AF_UNIX SOCK_SEQPACKET
+// 进程权限不变：User=can-gw，CAP_NET_RAW，AF_UNIX + AF_CAN，无网络。
 //
 // 编译：
 //   g++ -std=c++17 -O2 -pthread -Wall -Wextra can-gateway.cpp -o can-gateway
 // ============================================================================
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -35,6 +35,7 @@
 #include <unistd.h>
 
 #include "CanFrame.h"
+#include "Detection.h"
 #include "Ipc.h"
 #include "RingBuffer.h"
 
@@ -57,14 +58,44 @@ const Config& cfg() {
     return c;
 }
 
+std::uint64_t envU64(const char* name, std::uint64_t def) {
+    const char* s = std::getenv(name);
+    if (s == nullptr || *s == '\0') return def;
+    char* end = nullptr;
+    const unsigned long long v = std::strtoull(s, &end, 10);
+    if (end == s || (end != nullptr && *end != '\0')) return def;
+    return static_cast<std::uint64_t>(v);
+}
+
+bool envBool(const char* name, bool def) {
+    const char* s = std::getenv(name);
+    if (s == nullptr || *s == '\0') return def;
+    return !(std::strcmp(s, "0") == 0 ||
+             std::strcmp(s, "false") == 0 ||
+             std::strcmp(s, "no") == 0);
+}
+
+detection::Config loadDetectionConfig() {
+    detection::Config c;
+    c.windowNs        = envU64("UDS_WINDOW_MS", 1000) * 1000000ull;
+    c.reqThreshold    = static_cast<std::size_t>(
+                            std::max<std::uint64_t>(1, envU64("UDS_REQ_THRESHOLD", 5)));
+    c.nrcThreshold    = static_cast<std::size_t>(
+                            std::max<std::uint64_t>(1, envU64("UDS_NRC_THRESHOLD", 3)));
+    c.requireNrc      = envBool("UDS_REQUIRE_NRC", true);
+    c.replayWindowNs  = envU64("REPLAY_WINDOW_MS", 200) * 1000000ull;
+    c.replayThreshold = static_cast<std::size_t>(
+                            std::max<std::uint64_t>(1, envU64("REPLAY_THRESHOLD", 8)));
+    return c;
+}
+
 // ---------------------------------------------------------------------------
-constexpr std::size_t kQueueCapacity = 4096;   // 64 KB，10k fps 下约 400 ms
+constexpr std::size_t kQueueCapacity = 4096;
 constexpr std::size_t kBatchSize     = 32;
 constexpr std::size_t kAlertCapacity = 8;
 
-constexpr auto kAlertCooldown = std::chrono::seconds(5);
-constexpr auto kStatsPeriod   = std::chrono::seconds(1);
-constexpr auto kReconnectGap  = std::chrono::seconds(1);
+constexpr auto kStatsPeriod  = std::chrono::seconds(1);
+constexpr auto kReconnectGap = std::chrono::seconds(1);
 
 // ---------------------------------------------------------------------------
 RingBuffer<can_frame, kQueueCapacity>     g_queue;
@@ -78,6 +109,9 @@ std::atomic<std::uint64_t> g_bruteforce{0};
 std::atomic<std::uint64_t> g_dropped{0};
 std::atomic<std::uint64_t> g_busError{0};
 std::atomic<std::uint64_t> g_rxOverflow{0};
+std::atomic<std::uint64_t> g_udsRequests{0};
+std::atomic<std::uint64_t> g_replay{0};
+std::atomic<std::uint64_t> g_unlock{0};
 
 void onSignal(int) { g_running.store(false, std::memory_order_release); }
 
@@ -95,8 +129,30 @@ private:
     std::chrono::steady_clock::time_point m_last{};
 };
 
-// ---------------------------------------------------------------------------
-// 接收线程
+// 按告警类型分别限流：Unlock 最紧急（1 s 一次），Replay 最吵（30 s 一次）
+bool allowAlert(ipc::AlertKind kind) {
+    static std::array<AlertLimiter, 6> limiters = {{
+        AlertLimiter(std::chrono::hours(1)),      // 0：占位
+        AlertLimiter(std::chrono::seconds(5)),    // 1 Blacklist
+        AlertLimiter(std::chrono::seconds(5)),    // 2 Bruteforce
+        AlertLimiter(std::chrono::seconds(5)),    // 3 Malformed
+        AlertLimiter(std::chrono::seconds(30)),   // 4 Replay
+        AlertLimiter(std::chrono::seconds(1)),    // 5 UnauthorizedUnlock
+    }};
+    const std::size_t i = static_cast<std::size_t>(kind);
+    return i < limiters.size() && limiters[i].allow();
+}
+
+void pushAlert(std::uint32_t id, ipc::AlertKind kind,
+               std::uint32_t count, std::uint64_t nowNs) {
+    ipc::AlertMsg a{};
+    a.id    = id;
+    a.kind  = static_cast<std::uint32_t>(kind);
+    a.count = count;
+    a.tsNs  = nowNs;
+    g_alertQueue.push(a);
+}
+
 // ---------------------------------------------------------------------------
 void receiveThread(int s) {
     can_frame frame{};
@@ -137,11 +193,11 @@ void receiveThread(int s) {
 }
 
 // ---------------------------------------------------------------------------
-// 检测线程：只读内存、只做判断，没有任何系统调用
+// 检测线程：滑动窗口 + 状态机，全程只读内存
 // ---------------------------------------------------------------------------
 void processThread() {
     can_frame batch[kBatchSize];
-    AlertLimiter alertLimiter(kAlertCooldown);
+    detection::StatefulDetector detector{loadDetectionConfig()};
 
     while (g_running.load(std::memory_order_acquire)) {
         const std::size_t n = g_queue.popBatch(batch, kBatchSize);
@@ -149,6 +205,7 @@ void processThread() {
 
         for (std::size_t i = 0; i < n; ++i) {
             const can_frame& f = batch[i];
+            const std::uint64_t now = ipc::nowNs();
 
             if (f.can_id & CAN_ERR_FLAG) {
                 g_busError.fetch_add(1, std::memory_order_relaxed);
@@ -159,7 +216,7 @@ void processThread() {
                 continue;
             }
 
-            const std::uint32_t id = f.can_id & CAN_EFF_MASK;
+            const std::uint32_t id  = f.can_id & CAN_EFF_MASK;
             const std::uint8_t  dlc =
                 (f.can_dlc > CAN_MAX_DLEN) ? CAN_MAX_DLEN : f.can_dlc;
 
@@ -167,27 +224,47 @@ void processThread() {
 
             if (!myFrame.isValid()) {
                 g_bad.fetch_add(1, std::memory_order_relaxed);
-            } else if (id == 0x3C0) {
-                g_blacklisted.fetch_add(1, std::memory_order_relaxed);
-            } else if (id == 0x7E0 && dlc >= 2 && f.data[1] == 0x27) {
-                g_bruteforce.fetch_add(1, std::memory_order_relaxed);
-
-                if (alertLimiter.allow()) {
-                    ipc::AlertMsg a{};
-                    a.id   = id;
-                    a.kind = static_cast<std::uint32_t>(ipc::AlertKind::Bruteforce);
-                    a.tsNs = ipc::nowNs();
-                    g_alertQueue.push(a);          // POD 拷贝，纳秒级
-                }
-            } else {
-                g_normal.fetch_add(1, std::memory_order_relaxed);
+                if (allowAlert(ipc::AlertKind::Malformed))
+                    pushAlert(id, ipc::AlertKind::Malformed, 0, now);
+                continue;
             }
+
+            // 策略性黑名单：单帧即可判定，不需要窗口
+            if (id == 0x3C0) {
+                g_blacklisted.fetch_add(1, std::memory_order_relaxed);
+                if (allowAlert(ipc::AlertKind::Blacklist))
+                    pushAlert(id, ipc::AlertKind::Blacklist, 0, now);
+                continue;
+            }
+
+            // 行为检测：必须让每一帧都进入状态机，包括 ECU 的响应帧
+            const detection::Verdict v = detector.feed(f, now);
+            if (v.udsRequest) g_udsRequests.fetch_add(1, std::memory_order_relaxed);
+
+            if (v.alert) {
+                switch (v.event.kind) {
+                    case ipc::AlertKind::Bruteforce:
+                        g_bruteforce.fetch_add(1, std::memory_order_relaxed);
+                        break;
+                    case ipc::AlertKind::UnauthorizedUnlock:
+                        g_unlock.fetch_add(1, std::memory_order_relaxed);
+                        break;
+                    case ipc::AlertKind::Replay:
+                        g_replay.fetch_add(1, std::memory_order_relaxed);
+                        break;
+                    default:
+                        break;
+                }
+                if (allowAlert(v.event.kind)) {
+                    pushAlert(v.event.id, v.event.kind, v.event.count, now);
+                }
+            }
+
+            g_normal.fetch_add(1, std::memory_order_relaxed);
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// IPC 线程：唯一的出口。agent 不在时只丢消息，绝不阻塞。
 // ---------------------------------------------------------------------------
 void ipcThread() {
     using clock = std::chrono::steady_clock;
@@ -202,7 +279,6 @@ void ipcThread() {
 
     while (g_running.load(std::memory_order_acquire)) {
 
-        // ---- 连接维护：断开就每秒重试一次 --------------------------------
         if (fd < 0 && clock::now() >= nextConnect) {
             fd = ipc::connectUnix(cfg().ipcPath);
             nextConnect = clock::now() + kReconnectGap;
@@ -217,14 +293,12 @@ void ipcThread() {
             }
         }
 
-        // ---- 取告警：空队列时阻塞 ≤50 ms，避免忙等 ----------------------
         if (!hasPending) {
             hasPending = (g_alertQueue.popBatch(&pending, 1) != 0);
         } else if (fd < 0) {
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
 
-        // ---- 发送告警 ----------------------------------------------------
         if (hasPending && fd >= 0) {
             switch (ipc::sendPacket(fd, ipc::Type::Alert, pending)) {
                 case ipc::SendResult::Ok:
@@ -241,7 +315,6 @@ void ipcThread() {
             }
         }
 
-        // ---- 每秒统计：无论有没有连上都消费计数器，避免重连后出现尖峰 ----
         if (clock::now() >= nextStats) {
             nextStats = clock::now() + kStatsPeriod;
 
@@ -253,15 +326,21 @@ void ipcThread() {
             s.dropped     = g_dropped.load(std::memory_order_relaxed);
             s.busError    = g_busError.exchange(0, std::memory_order_relaxed);
             s.rxOverflow  = g_rxOverflow.load(std::memory_order_relaxed);
+            s.udsRequests = g_udsRequests.exchange(0, std::memory_order_relaxed);
+            s.replay      = g_replay.exchange(0, std::memory_order_relaxed);
+            s.unlock      = g_unlock.exchange(0, std::memory_order_relaxed);
             s.tsNs        = ipc::nowNs();
 
             std::fprintf(stderr,
                 "[STAT] normal=%llu bad=%llu black=%llu brute=%llu "
-                "drop=%llu busErr=%llu rxOv=%llu\n",
+                "uds=%llu replay=%llu unlock=%llu drop=%llu busErr=%llu rxOv=%llu\n",
                 static_cast<unsigned long long>(s.normal),
                 static_cast<unsigned long long>(s.bad),
                 static_cast<unsigned long long>(s.blacklisted),
                 static_cast<unsigned long long>(s.bruteforce),
+                static_cast<unsigned long long>(s.udsRequests),
+                static_cast<unsigned long long>(s.replay),
+                static_cast<unsigned long long>(s.unlock),
                 static_cast<unsigned long long>(s.dropped),
                 static_cast<unsigned long long>(s.busError),
                 static_cast<unsigned long long>(s.rxOverflow));
@@ -314,12 +393,20 @@ int main() {
         return 1;
     }
 
+    const detection::Config dc = loadDetectionConfig();
     std::fprintf(stderr,
-        "=== can-gateway 启动 ===\n"
-        "  接口 : %s\n"
-        "  IPC  : %s\n"
-        "  队列 : %zu 帧\n",
-        cfg().iface.c_str(), cfg().ipcPath.c_str(), kQueueCapacity);
+        "=== can-gateway (P2 stateful) ===\n"
+        "  接口     : %s\n"
+        "  IPC      : %s\n"
+        "  UDS 窗口 : %llu ms, 阈值 %zu 次, NRC 阈值 %zu\n"
+        "  NRC 门控 : %s\n"
+        "  重放窗口 : %llu ms, 阈值 %zu 次\n",
+        cfg().iface.c_str(), cfg().ipcPath.c_str(),
+        static_cast<unsigned long long>(dc.windowNs / 1000000ull),
+        dc.reqThreshold, dc.nrcThreshold,
+        dc.requireNrc ? "开" : "关",
+        static_cast<unsigned long long>(dc.replayWindowNs / 1000000ull),
+        dc.replayThreshold);
 
     std::thread tRecv(receiveThread, s);
     std::thread tProc(processThread);

@@ -1,0 +1,75 @@
+[Unit]
+Description=CAN Alert Agent (AI + TTS + HTTP, unprivileged)
+Documentation=file:///opt/can-sentinel/P1-INSTALL.md
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/opt/can-sentinel/bin/alert-agent
+Restart=always
+RestartSec=3s
+
+# ---------------------------------------------------------------------------
+# 身份：普通桌面用户，无任何 capability，看不到 CAN 设备。
+# Group=can-gw 只用于两件事：连上 gateway 的 socket、读取 /opt 下的 venv。
+# ---------------------------------------------------------------------------
+User=ye
+Group=ye
+SupplementaryGroups=audio
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+
+# ---------------------------------------------------------------------------
+# TTS 运行时配置（配合 deploy-tts.sh）
+#   · TTS_BIN 指向系统级 venv，root:can-gw 0755，ye 不可写
+#   · HOME 指到运行目录，避免 Python 往 /home/ye 写缓存
+#   · 禁止生成 .pyc，进一步保证 venv 只读也能正常工作
+# ---------------------------------------------------------------------------
+Environment=TTS_BIN=/opt/can-sentinel/venv/bin/edge-tts
+Environment=HOME=/run/can-sentinel
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PATH=/opt/can-sentinel/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PULSE_SERVER=unix:/run/user/1000/pulse/native
+
+# ---------------------------------------------------------------------------
+# 运行目录：systemd 创建 /run/can-sentinel，owner ye:can-gw，mode 0750
+# ---------------------------------------------------------------------------
+RuntimeDirectory=can-sentinel
+RuntimeDirectoryMode=0750
+UMask=0077
+
+# ---------------------------------------------------------------------------
+# 文件系统
+#
+# ProtectSystem=strict 把整个文件系统挂成只读，/opt 因此天然不可修改，
+# 但仍然可读、可执行 —— 这正是 venv 需要的。
+# ReadOnlyPaths 是显式冗余，让意图在单元文件里一眼可见。
+#
+# 注意：这里必须是 ProtectHome=read-only，不能写 yes。
+# ProtectHome=yes 会连 /run/user 一起隐藏，PipeWire/PulseAudio 的 socket
+# 就消失了，语音会直接失效。
+# ---------------------------------------------------------------------------
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ReadOnlyPaths=/opt/can-sentinel
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+
+# ---------------------------------------------------------------------------
+# 网络：AF_UNIX（IPC）+ IP（Ollama / Flask / edge-tts）
+# ---------------------------------------------------------------------------
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# 不要加 MemoryDenyWriteExecute=yes：edge-tts 依赖的部分扩展模块需要可执行映射。
+
+[Install]
+WantedBy=multi-user.target
